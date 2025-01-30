@@ -1,0 +1,237 @@
+# version is removed as per: https://github.com/docker/cli/pull/3445
+services:
+  # If you plan to deploy where a proxy is already in place, feel free to remove the traefik service
+  traefik:
+    container_name: traefik
+    image: docker.io/library/traefik:2.9
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+      - --entrypoints.websecure.address=:443
+      - --providers.file.filename=/etc/traefik/dynamic.yaml
+    ports: ['3002:80', '3003:443']
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      # - /home/infra/dyrectorio/certificates.yaml:/etc/traefik/dynamic.yaml
+      # Add a file to trafeik with certificate authority and domain cert.
+      - |
+        version: "0.1"
+        providers:
+          docker:
+            tls:
+              ca: /etc/certs/${LOCAL_CERT_AUTHORITY}.crt
+        tls:
+          certificates:
+            - certFile: /etc/certs/${LOCAL_CERT_AUTHORITY}.crt
+              keyFile: /etc/certs/${LOCAL_CERT_AUTHORITY}.key
+            - certFile: /etc/certs/${LOCAL_DOMAIN_CERT}.crt
+              keyFile: /etc/certs/${LOCAL_DOMAIN_CERT}.key
+        :/etc/certs/certificates.yaml
+      - ${EXTRA_CA_CERTS_DIR}:/etc/certs
+    restart: unless-stopped
+    labels:
+      - org.dyrectorio.service-category=_internal
+  crux:
+    container_name: crux
+    image: ghcr.io/dyrector-io/dyrectorio/web/crux:${DYO_VERSION:-stable}
+    command: [serve]
+    environment:
+      - TZ=${TIMEZONE:-UTC}
+      - GRPC_GO_LOG_SEVERITY_LEVEL=info
+      - GRPC_GO_LOG_VERBOSITY_LEVEL=99
+      # - GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=${EXTRA_CA_CERTS_DIR}/${LOCAL_CERT_AUTHORITY}.crt
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - DATABASE_URL=postgresql://crux:${CRUX_POSTGRES_PASSWORD}@crux-postgres:5432/crux?schema=public
+      - KRATOS_ADMIN_URL=http://kratos:4434
+      - KRATOS_URL=http://kratos:4433
+      - CRUX_UI_URL=${EXTERNAL_URL}
+      - CRUX_AGENT_ADDRESS=${DOMAIN}:443
+      - JWT_SECRET=${CRUX_SECRET}
+      - FROM_EMAIL=${FROM_EMAIL}
+      - FROM_NAME=${FROM_NAME}
+      - SMTP_URI=${SMTP_URI}
+      # If you don't have a mailserver you can use the provided mailslurper
+      # but keep in mind, this one is insecure, only use it at your own risk!
+      - SMTP_URI=smtps://test:test@mailslurper:1025/?skip_ssl_verify=true&legacy_ssl=true
+      - DISABLE_RECAPTCHA=${DISABLE_RECAPTCHA}
+      - RECAPTCHA_SECRET_KEY=${RECAPTCHA_SECRET_KEY}
+      - RECAPTCHA_SITE_KEY=${RECAPTCHA_SITE_KEY}
+      - QA_OPT_OUT=${QA_OPT_OUT:-false}
+      - ENCRYPTION_SECRET_KEY=${ENCRYPTION_SECRET_KEY}
+      - NODE_EXTRA_CA_CERTS=/etc/certs/${NODE_EXTRA_CA_CERTS}
+    volumes:
+      - ${EXTRA_CA_CERTS_DIR}:/etc/certs
+    depends_on:
+      crux-postgres:
+        condition: service_healthy
+      crux-migrate:
+        condition: service_completed_successfully
+      traefik:
+        condition: service_started
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.crux.rule=(Host(`${DOMAIN}`) && Headers(`content-type`, `application/grpc`))
+      - traefik.http.routers.crux.entrypoints=websecure
+      - traefik.http.routers.crux.service=crux
+      - traefik.http.services.crux.loadbalancer.server.port=5000
+      - traefik.http.services.crux.loadbalancer.server.scheme=h2c
+      - traefik.http.routers.crux.tls=true
+      - traefik.http.routers.crux.tls.domains[0].main=${DOMAIN}
+      - traefik.http.routers.crux-http.rule=Host(`${DOMAIN}`) && (PathPrefix(`/api`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/status`))
+      - traefik.http.routers.crux-http.entrypoints=websecure
+      - traefik.http.routers.crux-http.service=crux-http
+      - traefik.http.services.crux-http.loadbalancer.server.port=1848
+      - traefik.http.routers.crux-http.tls=true
+      - traefik.http.routers.crux-http.tls.domains[0].main=${DOMAIN}
+      - org.dyrectorio.service-category=_internal
+      # ports:
+      #   - 1848:1848 # http API
+  crux-migrate:
+    container_name: crux-migrate
+    image: ghcr.io/dyrector-io/dyrectorio/web/crux:${DYO_VERSION:-stable}
+    command: [migrate]
+    environment:
+      - TZ=${TIMEZONE:-UTC}
+      - DATABASE_URL=postgresql://crux:${CRUX_POSTGRES_PASSWORD}@crux-postgres:5432/crux?schema=public&connect_timeout=5
+      - NODE_EXTRA_CA_CERTS=/etc/certs/${NODE_EXTRA_CA_CERTS}
+      # - NODE_EXTRA_CA_CERTS=/etc/certs/GHCA.crt
+    volumes:
+      - ${EXTRA_CA_CERTS_DIR}:/etc/certs
+    depends_on:
+      crux-postgres:
+        condition: service_healthy
+    restart: 'no'
+    labels:
+      - org.dyrectorio.service-category=_internal
+  crux-postgres:
+    container_name: crux-postgres
+    image: docker.io/library/postgres:13-alpine
+    environment:
+      - POSTGRES_PASSWORD=${CRUX_POSTGRES_PASSWORD}
+      - POSTGRES_USER=crux
+      - POSTGRES_DB=crux
+    restart: unless-stopped
+    volumes: ['crux-db:/var/lib/postgresql/data']
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U crux]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    labels:
+      - org.dyrectorio.service-category=_internal
+  crux-ui:
+    container_name: crux-ui
+    image: ghcr.io/dyrector-io/dyrectorio/web/crux-ui:${DYO_VERSION:-stable}
+    environment:
+      - TZ=${TIMEZONE:-UTC}
+      - CRUX_UI_URL=${EXTERNAL_URL}
+      - KRATOS_URL=http://kratos:4433
+      - KRATOS_ADMIN_URL=http://kratos:4434
+      - CRUX_API_ADDRESS=crux:5001
+      - DISABLE_RECAPTCHA=${DISABLE_RECAPTCHA}
+      - RECAPTCHA_SECRET_KEY=${RECAPTCHA_SECRET_KEY}
+      - RECAPTCHA_SITE_KEY=${RECAPTCHA_SITE_KEY}
+      - NODE_EXTRA_CA_CERTS=/etc/certs/${NODE_EXTRA_CA_CERTS}
+    volumes:
+      - ${EXTRA_CA_CERTS_DIR}:/etc/certs
+    depends_on:
+      crux:
+        condition: service_started
+      traefik:
+        condition: service_started
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.crux-ui.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.crux-ui.entrypoints=websecure
+      - traefik.http.services.crux-ui.loadbalancer.server.port=3000
+      - traefik.http.routers.crux-ui.tls=true
+      - traefik.http.routers.crux-ui.tls.domains[0].main=${DOMAIN}
+      - org.dyrectorio.service-category=_internal
+  kratos:
+    container_name: kratos
+    image: ghcr.io/dyrector-io/dyrectorio/web/kratos:${DYO_VERSION:-stable}
+    environment:
+      - SQA_OPT_OUT=true
+      - DSN=postgres://kratos:${KRATOS_POSTGRES_PASSWORD}@kratos-postgres:5432/kratos?sslmode=disable&max_conns=20&max_idle_conns=4&connect_timeout=5
+      - KRATOS_URL=${EXTERNAL_URL}/kratos
+      - KRATOS_ADMIN_URL=http://kratos:4434
+      - AUTH_URL=${EXTERNAL_URL}/auth
+      - CRUX_UI_URL=${EXTERNAL_URL}
+      - LOG_LEVEL=info
+      - LOG_LEAK_SENSITIVE_VALUES=false
+      - SECRETS_COOKIE=${KRATOS_SECRET}
+      - COURIER_SMTP_CONNECTION_URI=${SMTP_URI}
+      - FROM_EMAIL=${FROM_EMAIL}
+      - FROM_NAME=${FROM_NAME}
+      # If you don't have a mailserver you can use the provided mailslurper
+      # but keep in mind, this one is insecure, only use it at your own risk!
+      - COURIER_SMTP_CONNECTION_URI=smtps://test:test@mailslurper:1025/?skip_ssl_verify=true&legacy_ssl=true
+      - SSL_CERT_FILE=/etc/certs/${LOCAL_CERT_AUTHORITY}.crt # Go respects this env variable for custom CA certificates
+      # - GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/certs/GHCA.crt
+    volumes:
+      - ${EXTRA_CA_CERTS_DIR}:/etc/certs
+    depends_on:
+      kratos-postgres:
+        condition: service_healthy
+      kratos-migrate:
+        condition: service_completed_successfully
+      traefik:
+        condition: service_started
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kratos.rule=(Host(`${DOMAIN}`) && PathPrefix(`/kratos`))
+      - traefik.http.routers.kratos.entrypoints=websecure
+      - traefik.http.services.kratos.loadbalancer.server.port=4433
+      - traefik.http.middlewares.kratos-strip.stripprefix.prefixes=/kratos
+      - traefik.http.middlewares.kratos-ratelimit.ratelimit.average=100
+      - traefik.http.routers.kratos.middlewares=kratos-strip,kratos-ratelimit
+      - traefik.http.routers.kratos.tls=true
+      - traefik.http.routers.kratos.tls.domains[0].main=${DOMAIN}
+      - org.dyrectorio.service-category=_internal
+  kratos-migrate:
+    container_name: kratos-migrate
+    image: ghcr.io/dyrector-io/dyrectorio/web/kratos:${DYO_VERSION:-stable}
+    command: -c /etc/config/kratos/kratos.yaml migrate sql -e --yes
+    environment:
+      - SQA_OPT_OUT=true
+      - DSN=postgres://kratos:${KRATOS_POSTGRES_PASSWORD}@kratos-postgres:5432/kratos?sslmode=disable&max_conns=20&max_idle_conns=4
+    depends_on:
+      kratos-postgres:
+        condition: service_healthy
+    restart: 'no'
+    labels:
+      - org.dyrectorio.service-category=_internal
+  kratos-postgres:
+    container_name: kratos-postgres
+    image: docker.io/library/postgres:13-alpine
+    environment:
+      - POSTGRES_PASSWORD=${KRATOS_POSTGRES_PASSWORD}
+      - POSTGRES_USER=kratos
+      - POSTGRES_DB=kratos
+    restart: unless-stopped
+    volumes: ['kratos-db:/var/lib/postgresql/data']
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U kratos]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    labels:
+      - org.dyrectorio.service-category=_internal
+# # This is insecure, do not use this in production or on the public internet
+  mailslurper:
+    container_name: mailslurper
+    image: docker.io/oryd/mailslurper:smtps-latest
+    ports:  # port 1025 is used internally for smtp, you do not have to expose that
+      - 4436:4436  # web UI
+      - 4437:4437  # http API
+    restart: unless-stopped
+volumes:
+  crux-db:
+  kratos-db:
