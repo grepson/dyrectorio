@@ -21,7 +21,7 @@ services:
     configs:
       # Add a file to trafeik with certificate authority and domain cert.
       - source: certificates
-        target: /etc/certs/certificates.yaml
+        target: /etc/traefik/dynamic.yaml
     restart: unless-stopped
     labels:
       - org.dyrectorio.service-category=_internal
