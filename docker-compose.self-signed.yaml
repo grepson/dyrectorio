@@ -18,19 +18,23 @@ services:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
       # - /home/infra/dyrectorio/certificates.yaml:/etc/traefik/dynamic.yaml
       # Add a file to trafeik with certificate authority and domain cert.
-      - |
-        version: "0.1"
-        providers:
-          docker:
+      - type: bind
+        source: /dev/null
+        target: /etc/certs/certificates.yaml
+        bind:
+          create_host_path: true
+          content: |
+            version: "0.1"
+            providers:
+              docker:
+                tls:
+                  ca: /etc/certs/${LOCAL_CERT_AUTHORITY}.crt
             tls:
-              ca: /etc/certs/${LOCAL_CERT_AUTHORITY}.crt
-        tls:
-          certificates:
-            - certFile: /etc/certs/${LOCAL_CERT_AUTHORITY}.crt
-              keyFile: /etc/certs/${LOCAL_CERT_AUTHORITY}.key
-            - certFile: /etc/certs/${LOCAL_DOMAIN_CERT}.crt
-              keyFile: /etc/certs/${LOCAL_DOMAIN_CERT}.key
-        :/etc/certs/certificates.yaml
+              certificates:
+                - certFile: /etc/certs/${LOCAL_CERT_AUTHORITY}.crt
+                  keyFile: /etc/certs/${LOCAL_CERT_AUTHORITY}.key
+                - certFile: /etc/certs/${LOCAL_DOMAIN_CERT}.crt
+                  keyFile: /etc/certs/${LOCAL_DOMAIN_CERT}.key
       - ${EXTRA_CA_CERTS_DIR}:/etc/certs
     restart: unless-stopped
     labels:
